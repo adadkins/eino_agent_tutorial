@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	langfuse "github.com/cloudwego/eino-ext/callbacks/langfuse/v2"
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
@@ -37,6 +39,18 @@ func main() {
 		log.Println("No .env file found; using environment variables")
 	}
 
+	handler := initTracing()
+
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		log.Println("Shutting down Langfuse...")
+
+		if err := handler.Shutdown(ctx); err != nil {
+			log.Printf("Langfuse shutdown error: %v", err)
+		}
+	}()
 	ctx := context.Background()
 
 	agent, err := buildAgent(ctx)
@@ -76,8 +90,19 @@ func chatHandler(agent *react.Agent) http.HandlerFunc {
 		toolFired := false
 		handler := callbackHelper.NewHandlerHelper().
 			Tool(&callbackHelper.ToolCallbackHandler{
-				OnStart: func(ctx context.Context, info *callbacks.RunInfo, input *tool.CallbackInput) context.Context {
+				OnStart: func(
+					ctx context.Context,
+					info *callbacks.RunInfo,
+					input *tool.CallbackInput,
+				) context.Context {
 					toolFired = true
+
+					if info != nil {
+						log.Printf("TOOL CALLBACK: %s", info.Name)
+					} else {
+						log.Println("TOOL CALLBACK: unknown")
+					}
+
 					return ctx
 				},
 			}).Handler()
@@ -102,7 +127,6 @@ func chatHandler(agent *react.Agent) http.HandlerFunc {
 		if !toolFired {
 			answer = refusalMessage
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(tools.ChatResponse{Answer: answer, ToolUsed: toolFired})
 	}
@@ -111,4 +135,36 @@ func chatHandler(agent *react.Agent) http.HandlerFunc {
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
+}
+
+func initTracing() *langfuse.CallbackHandler {
+	ctx := context.Background()
+
+	pubKey := os.Getenv("LANGFUSE_PUBLIC_KEY")
+	secKey := os.Getenv("LANGFUSE_SECRET_KEY")
+	host := os.Getenv("LANGFUSE_BASE_URL")
+
+	if pubKey == "" || secKey == "" || host == "" {
+		log.Fatal("One or more LANGFUSE environment variables are empty")
+	}
+
+	log.Printf("Langfuse host: %s", host)
+	log.Println("Initializing Langfuse...")
+
+	handler, err := langfuse.NewHandler(ctx, &langfuse.Config{
+		Host:        host,
+		PublicKey:   pubKey,
+		SecretKey:   secKey,
+		ServiceName: "eino-agent",
+		Environment: "development",
+	})
+	if err != nil {
+		log.Fatalf("failed to initialize Langfuse: %v", err)
+	}
+
+	callbacks.AppendGlobalHandlers(handler)
+
+	log.Println("Langfuse handler registered")
+
+	return handler
 }
